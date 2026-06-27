@@ -11,9 +11,15 @@ from enum import Enum
 from typing import Optional, Dict, List
 from dataclasses import dataclass
 import logging
+import json
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configuration du logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
@@ -60,18 +66,31 @@ class TicketBotBase:
         self.queue_module = queue_module
         self.timeout = timeout
         self.session = requests.Session()
+        self._setup_session_retry()
         self.cart: Optional[Cart] = None
         self.queue_token: Optional[str] = None
+        
+    def _setup_session_retry(self):
+        """Configure la stratégie de retry pour les requêtes"""
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         
     def get_site_url(self) -> str:
         """Retourne l'URL de base du site"""
         urls = {
             SiteList.AUTEUIL: "https://www.auteuil.com",
-            SiteList.PSG: "https://www.psg.fr",
+            SiteList.PSG: "https://billetterie.psg.fr/fr",
             SiteList.LENS: "https://www.lensfc.fr",
             SiteList.TICKETMASTER_FR: "https://www.ticketmaster.fr",
             SiteList.WETIX_FCFS: "https://www.wetix.fr",
-            SiteList.STADE_DE_FRANCE: "https://www.stadedefrance.com"
+            SiteList.STADE_DE_FRANCE: "https://www.stadefrance.com/fr/billetteries/concerts"
         }
         return urls[self.site]
     
@@ -95,18 +114,17 @@ class TicketBotBase:
         """Initialise Queue-it"""
         logger.info("Initialisation Queue-it")
         try:
-            # Intégration Queue-it
             headers = {
-                'User-Agent': 'TicketBot/1.0'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             response = self.session.get(
-                f"{self.get_site_url()}/queue",
+                f"{self.get_site_url()}/",
                 headers=headers,
                 timeout=self.timeout
             )
             if response.status_code == 200:
-                # Extraction du token Queue-it
-                self.queue_token = response.headers.get('QueueITToken')
+                # Queue-it utilise généralement les cookies
+                self.queue_token = self.session.cookies.get('QueueITToken', '')
                 logger.info("Queue-it initialisée avec succès")
                 return True
         except Exception as e:
@@ -117,13 +135,19 @@ class TicketBotBase:
         """Initialise Wetix"""
         logger.info("Initialisation Wetix")
         try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
             response = self.session.post(
-                f"{self.get_site_url()}/api/wetix/init",
+                f"{self.get_site_url()}/api/queue/wetix/init",
                 json={"site": self.site.value},
+                headers=headers,
                 timeout=self.timeout
             )
-            if response.status_code == 200:
-                self.queue_token = response.json().get('token')
+            if response.status_code in [200, 201]:
+                data = response.json()
+                self.queue_token = data.get('token', data.get('session_id', ''))
                 logger.info("Wetix initialisée avec succès")
                 return True
         except Exception as e:
@@ -134,13 +158,19 @@ class TicketBotBase:
         """Initialise Secutix"""
         logger.info("Initialisation Secutix")
         try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
             response = self.session.post(
-                f"{self.get_site_url()}/api/secutix/init",
+                f"{self.get_site_url()}/api/queue/secutix/init",
                 json={"site": self.site.value},
+                headers=headers,
                 timeout=self.timeout
             )
-            if response.status_code == 200:
-                self.queue_token = response.json().get('session_id')
+            if response.status_code in [200, 201]:
+                data = response.json()
+                self.queue_token = data.get('session_id', data.get('token', ''))
                 logger.info("Secutix initialisée avec succès")
                 return True
         except Exception as e:
@@ -151,13 +181,19 @@ class TicketBotBase:
         """Initialise Paylogic"""
         logger.info("Initialisation Paylogic")
         try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
             response = self.session.post(
-                f"{self.get_site_url()}/api/paylogic/init",
+                f"{self.get_site_url()}/api/queue/paylogic/init",
                 json={"site": self.site.value},
+                headers=headers,
                 timeout=self.timeout
             )
-            if response.status_code == 200:
-                self.queue_token = response.json().get('session_token')
+            if response.status_code in [200, 201]:
+                data = response.json()
+                self.queue_token = data.get('session_token', data.get('token', ''))
                 logger.info("Paylogic initialisée avec succès")
                 return True
         except Exception as e:
@@ -169,12 +205,14 @@ class TicketBotBase:
         logger.info("Création d'un nouveau panier")
         try:
             response = self.session.post(
-                f"{self.get_site_url()}/api/cart/create",
+                f"{self.get_site_url()}/api/v1/cart",
                 headers=self._get_headers(),
+                json={},
                 timeout=self.timeout
             )
-            if response.status_code == 201:
-                session_id = response.json().get('session_id')
+            if response.status_code in [200, 201]:
+                data = response.json()
+                session_id = data.get('session_id', data.get('id', ''))
                 self.cart = Cart(session_id=session_id, tickets=[])
                 logger.info(f"Panier créé: {session_id}")
                 return True
@@ -190,20 +228,25 @@ class TicketBotBase:
         
         logger.info(f"Ajout au panier: {ticket.quantity}x {ticket.ticket_type}")
         try:
+            payload = {
+                "event_id": ticket.event_id,
+                "ticket_type": ticket.ticket_type,
+                "quantity": ticket.quantity
+            }
+            
             response = self.session.post(
-                f"{self.get_site_url()}/api/cart/{self.cart.session_id}/add",
-                json={
-                    "event_id": ticket.event_id,
-                    "ticket_type": ticket.ticket_type,
-                    "quantity": ticket.quantity
-                },
+                f"{self.get_site_url()}/api/v1/cart/{self.cart.session_id}/items",
+                json=payload,
                 headers=self._get_headers(),
                 timeout=self.timeout
             )
-            if response.status_code == 200:
+            
+            if response.status_code in [200, 201, 204]:
                 self.cart.tickets.append(ticket)
                 logger.info(f"Billet ajouté au panier avec succès")
                 return True
+            else:
+                logger.error(f"Erreur serveur: {response.status_code} - {response.text}")
         except Exception as e:
             logger.error(f"Erreur lors de l'ajout au panier: {e}")
         return False
@@ -216,13 +259,12 @@ class TicketBotBase:
         
         logger.info(f"Suppression du billet: {ticket_id}")
         try:
-            response = self.session.post(
-                f"{self.get_site_url()}/api/cart/{self.cart.session_id}/remove",
-                json={"ticket_id": ticket_id},
+            response = self.session.delete(
+                f"{self.get_site_url()}/api/v1/cart/{self.cart.session_id}/items/{ticket_id}",
                 headers=self._get_headers(),
                 timeout=self.timeout
             )
-            if response.status_code == 200:
+            if response.status_code in [200, 204]:
                 logger.info("Billet supprimé du panier")
                 return True
         except Exception as e:
@@ -237,12 +279,14 @@ class TicketBotBase:
         
         try:
             response = self.session.get(
-                f"{self.get_site_url()}/api/cart/{self.cart.session_id}",
+                f"{self.get_site_url()}/api/v1/cart/{self.cart.session_id}",
                 headers=self._get_headers(),
                 timeout=self.timeout
             )
             if response.status_code == 200:
-                return response.json()
+                cart_data = response.json()
+                logger.info(f"Panier récupéré: {json.dumps(cart_data, indent=2)}")
+                return cart_data
         except Exception as e:
             logger.error(f"Erreur lors de la récupération du panier: {e}")
         return None
@@ -256,13 +300,16 @@ class TicketBotBase:
         logger.info("Validation du panier (checkout)")
         try:
             response = self.session.post(
-                f"{self.get_site_url()}/api/cart/{self.cart.session_id}/checkout",
+                f"{self.get_site_url()}/api/v1/cart/{self.cart.session_id}/checkout",
                 headers=self._get_headers(),
+                json={},
                 timeout=self.timeout
             )
-            if response.status_code == 200:
+            if response.status_code in [200, 201]:
                 logger.info("Panier validé avec succès")
                 return True
+            else:
+                logger.error(f"Erreur checkout: {response.status_code}")
         except Exception as e:
             logger.error(f"Erreur lors de la validation du panier: {e}")
         return False
@@ -270,11 +317,13 @@ class TicketBotBase:
     def _get_headers(self) -> Dict[str, str]:
         """Retourne les headers HTTP avec le token de queue"""
         headers = {
-            'User-Agent': 'TicketBot/1.0',
-            'Content-Type': 'application/json'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         }
         if self.queue_token:
             headers['Authorization'] = f'Bearer {self.queue_token}'
+            headers['X-Queue-Token'] = self.queue_token
         return headers
 
 
@@ -283,40 +332,42 @@ class TicketBot(TicketBotBase):
     
     def run(self, tickets_to_buy: List[Ticket]) -> bool:
         """Exécute la séquence complète d'achat"""
-        logger.info(f"Démarrage du bot pour {self.site.value}")
+        logger.info(f"🎫 Démarrage du bot pour {self.site.value}")
         
         # Étape 1: Initialiser la queue
         if not self.initialize_queue():
-            logger.error("Impossible d'initialiser la queue")
-            return False
+            logger.warning("⚠️ Impossible d'initialiser la queue (peut ne pas être bloquant)")
         
         time.sleep(1)
         
         # Étape 2: Créer un panier
         if not self.create_cart():
-            logger.error("Impossible de créer un panier")
+            logger.error("❌ Impossible de créer un panier")
             return False
         
         time.sleep(1)
         
         # Étape 3: Ajouter les billets au panier
-        for ticket in tickets_to_buy:
+        for i, ticket in enumerate(tickets_to_buy, 1):
+            logger.info(f"[{i}/{len(tickets_to_buy)}] Ajout du billet...")
             if not self.add_to_cart(ticket):
-                logger.error(f"Impossible d'ajouter le billet: {ticket}")
+                logger.error(f"❌ Impossible d'ajouter le billet: {ticket}")
                 return False
             time.sleep(0.5)
         
         # Étape 4: Afficher le panier
         cart_content = self.get_cart()
         if cart_content:
-            logger.info(f"Contenu du panier: {cart_content}")
+            logger.info(f"✅ Contenu du panier: {cart_content}")
+        else:
+            logger.warning("⚠️ Impossible de récupérer le panier")
         
         # Étape 5: Valider le panier
         if not self.checkout():
-            logger.error("Impossible de valider le panier")
+            logger.error("❌ Impossible de valider le panier")
             return False
         
-        logger.info("Achat complété avec succès!")
+        logger.info("✅ Achat complété avec succès!")
         return True
 
 
